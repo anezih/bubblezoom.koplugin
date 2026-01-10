@@ -34,7 +34,6 @@ jobs:
           zip -r $ZIP_NAME $TARGET_DIR
 
           echo "FINAL_ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
-          echo "TARGET_DIR=$TARGET_DIR" >> $GITHUB_ENV
 
       - name: Attach to Release
         if: github.event_name == 'release'
@@ -48,5 +47,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.FINAL_ZIP_NAME }}
-          path: ${{ env.TARGET_DIR }}
+          path: ${{ env.FINAL_ZIP_NAME }}
           retention-days: 1
