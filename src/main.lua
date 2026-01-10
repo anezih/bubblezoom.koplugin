@@ -70,6 +70,8 @@ local BubbleZoom = InputContainer:extend{
     overlay_scale_active = nil,
     overlay = nil,
     sauvola_cache = nil,
+    use_custom_contrast = false,
+    custom_contrast = 2.0,
 }
 
 ---Loads global settings; used by plugin init.
@@ -85,6 +87,8 @@ function BubbleZoom:init()
     self.closing_radius = G_reader_settings:readSetting("bubblezoom_closing_radius", 1)
     self.closing_margin = G_reader_settings:readSetting("bubblezoom_closing_margin", 6)
     self.max_roi = G_reader_settings:readSetting("bubblezoom_max_roi", 96)
+    self.use_custom_contrast = G_reader_settings:readSetting("bubblezoom_use_custom_contrast", false)
+    self.custom_contrast = G_reader_settings:readSetting("bubblezoom_custom_contrast", 2.0)
 end
 
 ---Registers menu entries, overlay view, and touch zones; used by the reader-ready hook.
@@ -167,6 +171,53 @@ function BubbleZoom:addToMainMenu(menu_items)
             {
                 text = _("Advanced"),
                 sub_item_table = {
+                    {
+                        text = _("Custom Contrast"),
+                        sub_item_table = {
+                            {
+                                text = _("Use custom contrast value"),
+                                checked_func = function() return self.use_custom_contrast end,
+                                help_text = _("When enabled, a custom contrast value is used for bubble detection. Higher values may improve detection accuracy."),
+                                keep_menu_open = true,
+                                callback = function(touchmenu_instance)
+                                    self.use_custom_contrast = not self.use_custom_contrast
+                                    G_reader_settings:saveSetting("bubblezoom_use_custom_contrast", self.use_custom_contrast)
+                                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                                end,
+                            },
+                            {
+                                text_func = function()
+                                    return T(_("Custom contrast: %1"), string.format("%.2f", self.custom_contrast))
+                                end,
+                                help_text = _("Contrast value used for bubble detection when enabled."),
+                                keep_menu_open = true,
+                                enabled_func = function() return self.use_custom_contrast end,
+                                callback = function(touchmenu_instance)
+                                    local spin = SpinWidget:new{
+                                        title_text = _("Custom contrast"),
+                                        info_text = _("Contrast value used for bubble detection."),
+                                        value = self.custom_contrast,
+                                        value_default = 2.0,
+                                        value_min = 0.8,
+                                        value_max = 10.0,
+                                        value_step = 0.1,
+                                        value_hold_step = 0.5,
+                                        precision = "%.2f",
+                                        callback = function(widget)
+                                            local value = widget.value
+                                            if value < 0.8 then value = 0.8 end
+                                            if value > 10.0 then value = 10.0 end
+                                            self.custom_contrast = value
+                                            G_reader_settings:saveSetting("bubblezoom_custom_contrast", value)
+                                            if touchmenu_instance then touchmenu_instance:updateItems() end
+                                        end,
+                                    }
+                                    UIManager:show(spin)
+                                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                                end,
+                            },
+                        },
+                    },
                     {
                         text = _("Sauvola Thresholding"),
                         sub_item_table = {
@@ -417,6 +468,8 @@ function BubbleZoom:addToMainMenu(menu_items)
                             self.closing_margin = 6
                             self.max_roi = 96
                             self.padding_ratio = 0.01
+                            self.use_custom_contrast = false
+                            self.custom_contrast = 2.0
                             G_reader_settings:saveSetting("bubblezoom_sauvola_window_size", 31)
                             G_reader_settings:saveSetting("bubblezoom_sauvola_k", 0.35)
                             G_reader_settings:saveSetting("bubblezoom_sauvola_r", 128.0)
@@ -425,6 +478,8 @@ function BubbleZoom:addToMainMenu(menu_items)
                             G_reader_settings:saveSetting("bubblezoom_closing_margin", 6)
                             G_reader_settings:saveSetting("bubblezoom_max_roi", 96)
                             G_reader_settings:saveSetting("bubblezoom_padding_ratio", 0.01)
+                            G_reader_settings:saveSetting("bubblezoom_use_custom_contrast", false)
+                            G_reader_settings:saveSetting("bubblezoom_custom_contrast", 2.0)
                             if touchmenu_instance then touchmenu_instance:updateItems() end
                         end,
                     },
@@ -737,6 +792,19 @@ function BubbleZoom:getSauvolaCache(pageno, rotation, gamma)
     return cache
 end
 
+---Returns the effective contrast for detection (system or custom).
+---@return number gamma
+function BubbleZoom:getDetectionGamma()
+    local gamma = self.view and self.view.state and self.view.state.gamma or 1.0
+    if not self.use_custom_contrast then
+        return gamma
+    end
+    local custom = tonumber(self.custom_contrast) or gamma
+    if custom < 0.8 then custom = 0.8 end
+    if custom > 10.0 then custom = 10.0 end
+    return custom
+end
+
 ---Detects a speech bubble rectangle via Sauvola mask + flood fill; used by onBubbleGesture.
 ---@param pageno number
 ---@param tap_x number
@@ -744,7 +812,7 @@ end
 ---@return Geom|nil rect
 function BubbleZoom:detectBubbleRect(pageno, tap_x, tap_y)
     local rotation = self.view and self.view.state and self.view.state.rotation or 0
-    local gamma = self.view and self.view.state and self.view.state.gamma or 1.0
+    local gamma = self:getDetectionGamma()
     local cache = self:getSauvolaCache(pageno, rotation, gamma)
     if not cache then
         return nil
