@@ -2,7 +2,7 @@
 
 This plugin enables users to magnify a speech bubble on a comics/manga page by tapping or long pressing it. You can access the plugin's settings from the Typesetting menu (second from the left) in the top menu bar.
 
-<img src="img/bubblezoom_demo_low.gif" width="450">
+<img src="img/bubblezoom_demo_low_v1_1.gif" width="450">
 
 *Plugin preview*
 
