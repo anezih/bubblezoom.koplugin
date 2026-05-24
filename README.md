@@ -11,6 +11,23 @@ This plugin enables users to magnify a speech bubble on a comics/manga page by t
 
 Download the latest version of the plugin from the [releases](https://github.com/anezih/bubblezoom.koplugin/releases). Copy the `bubblezoom.koplugin` folder to your KOReader installation's `plugins` directory.
 
+# Offline Translator Integration
+
+Bubble Zoom can use `offlinetranslator.koplugin` to OCR enlarged speech bubbles
+and translate them locally. The Bubble Zoom settings menu includes automatic
+bubble translation, translation on long-press of an enlarged bubble, translation
+direction, OCR engine, and OCR engine-specific options.
+
+For comics, PPOCR is usually the most useful OCR engine for speech bubbles and
+mixed page text when its PP-OCRv5 files are installed. For Japanese manga,
+Manga OCR is often the best option for vertical and multi-line bubbles.
+Tesseract remains a small fallback and works well for some languages, but for
+Japanese vertical text it can produce sub-optimal results.
+
+The Offline Translator integration is supported only on Linux x86_64 and
+Android arm64-v8a builds. Install Offline Translator and its data files from:
+https://github.com/anezih/offlinetranslator.koplugin
+
 
 # Disclosure
 

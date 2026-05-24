@@ -1,7 +1,15 @@
+local DataStorage = require("datastorage")
 local Device = require("device")
+local Font = require("ui/font")
+local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local InputContainer = require("ui/widget/container/inputcontainer")
+local Menu = require("ui/widget/menu")
+local PluginShare = require("pluginshare")
+local Size = require("ui/size")
+local TextBoxWidget = require("ui/widget/textboxwidget")
 local UIManager = require("ui/uimanager")
+local InfoMessage = require("ui/widget/infomessage")
 local Notification = require("ui/widget/notification")
 local SpinWidget = require("ui/widget/spinwidget")
 local Widget = require("ui/widget/widget")
@@ -9,10 +17,12 @@ local logger = require("logger")
 local time = require("ui/time")
 local bit = require("bit")
 local ffi = require("ffi")
+local lfs = require("libs/libkoreader-lfs")
 local util = require("util")
 local Blitbuffer = require("ffi/blitbuffer")
 local _ = require("gettext")
 local T = require("ffi/util").template
+local Screen = Device.screen
 local math_floor = math.floor
 local math_max = math.max
 local math_min = math.min
@@ -32,6 +42,24 @@ local SAUVOLA_DOWNSAMPLE_MAX_WIDTH_DEFAULT = 1600
 local SAUVOLA_DOWNSAMPLE_MAX_WIDTH_MIN = 0
 local SAUVOLA_DOWNSAMPLE_MAX_WIDTH_MAX = 4096
 local SAUVOLA_DOWNSAMPLE_ENABLED_DEFAULT = true
+
+local function normalizeOcrTextForTranslation(text)
+    text = (text or ""):gsub("\r", "\n")
+    text = text:gsub("%-%s*\n%s*", "")
+    text = text:gsub("%s*\n%s*", " ")
+    text = text:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+    local letters, uppercase = 0, 0
+    for c in text:gmatch("%a") do
+        letters = letters + 1
+        if c == c:upper() and c ~= c:lower() then
+            uppercase = uppercase + 1
+        end
+    end
+    if letters > 8 and uppercase / letters > 0.7 then
+        text = text:lower()
+    end
+    return text
+end
 
 ---Queue-based flood fill (current default); returns filled count, bounds, and optional mask.
 local function floodFillQueue(bx, by, width, height, mask, pixel_count, closed, roi, need_mask)
@@ -406,7 +434,19 @@ function BubbleZoomOverlay:paintTo(bb, x, y)
     else
         owner.document:drawPage(bb, rx, ry, rect_scaled, owner.overlay_page, zoom, rotation, gamma)
     end
+end
 
+local BubbleTranslationWidget = InputContainer:extend{
+    modal = false,
+    toast = true,
+    content = nil,
+    dimen = nil,
+}
+
+function BubbleTranslationWidget:paintTo(bb, x, y)
+    if self.content and self.dimen then
+        self.content:paintTo(bb, self.dimen.x, self.dimen.y)
+    end
 end
 
 local BubbleZoom = InputContainer:extend{
@@ -441,6 +481,17 @@ local BubbleZoom = InputContainer:extend{
     overlay_tap_x = nil,
     overlay_tap_y = nil,
     overlay = nil,
+    translation_widget = nil,
+    translation_x = nil,
+    translation_y = nil,
+    translation_job_id = 0,
+    auto_translate = false,
+    translate_on_overlay_hold = false,
+    translation_timeout = 0,
+    debug_ocr_images = false,
+    ocr_engine = "tesseract",
+    ocr_psm = "auto",
+    ppocr_script = "cj",
     sauvola_cache = nil,
     use_custom_contrast = false,
     custom_contrast = 2.0,
@@ -468,6 +519,17 @@ function BubbleZoom:init()
     self.custom_contrast = G_reader_settings:readSetting("bubblezoom_custom_contrast", 2.0)
     self.use_full_shape = G_reader_settings:readSetting("bubblezoom_use_full_shape", FULL_SHAPE_ENABLED_DEFAULT)
     self.use_scanline_floodfill = G_reader_settings:readSetting("bubblezoom_use_scanline_floodfill", false)
+    self.auto_translate = G_reader_settings:readSetting("bubblezoom_auto_translate", false)
+    self.translate_on_overlay_hold = G_reader_settings:readSetting("bubblezoom_translate_on_overlay_hold", false)
+    if self.auto_translate and self.translate_on_overlay_hold then
+        self.translate_on_overlay_hold = false
+        G_reader_settings:saveSetting("bubblezoom_translate_on_overlay_hold", false)
+    end
+    self.translation_timeout = G_reader_settings:readSetting("bubblezoom_translation_timeout", 0)
+    self.debug_ocr_images = G_reader_settings:readSetting("bubblezoom_debug_ocr_images", false)
+    self.ocr_engine = G_reader_settings:readSetting("bubblezoom_ocr_engine", "tesseract")
+    self.ocr_psm = G_reader_settings:readSetting("bubblezoom_ocr_psm", "auto")
+    self.ppocr_script = G_reader_settings:readSetting("bubblezoom_ppocr_script", "cj")
     self.scanline_outline_width = G_reader_settings:readSetting("bubblezoom_scanline_outline_width", SCANLINE_OUTLINE_WIDTH_DEFAULT)
     if self.scanline_outline_width < SCANLINE_OUTLINE_WIDTH_MIN then self.scanline_outline_width = SCANLINE_OUTLINE_WIDTH_MIN end
     if self.scanline_outline_width > SCANLINE_OUTLINE_WIDTH_MAX then self.scanline_outline_width = SCANLINE_OUTLINE_WIDTH_MAX end
@@ -506,6 +568,7 @@ function BubbleZoom:onPageUpdate()
     self.overlay_mask_region_h = nil
     self.overlay_tap_x = nil
     self.overlay_tap_y = nil
+    self:clearTranslationOverlay()
     self.sauvola_cache = nil
     if had_cache then
         gc_count = gc_count + 1
@@ -519,9 +582,442 @@ function BubbleZoom:onPageUpdate()
     end
 end
 
+function BubbleZoom:offlineTranslator()
+    local api = PluginShare.offlinetranslator
+    if type(api) == "table" and type(api.translate) == "function" and type(api.ocrImageRgba) == "function" then
+        return api
+    end
+end
+
+function BubbleZoom:clearTranslationOverlay()
+    self.translation_job_id = (self.translation_job_id or 0) + 1
+    if self.translation_widget then
+        UIManager:close(self.translation_widget)
+    end
+    self.translation_widget = nil
+    self.translation_x = nil
+    self.translation_y = nil
+end
+
+function BubbleZoom:getTranslationDirection(api)
+    local from_code = G_reader_settings:readSetting("bubblezoom_translation_from")
+    local to_code = G_reader_settings:readSetting("bubblezoom_translation_to")
+    if from_code and to_code then
+        return from_code, to_code
+    end
+    local direction = api and api.getDirection and api.getDirection()
+    if direction then
+        return direction.from, direction.to
+    end
+end
+
+function BubbleZoom:getTessdataLanguage(api)
+    return G_reader_settings:readSetting("bubblezoom_tess_lang")
+        or (api and api.getTessdataLanguage and api.getTessdataLanguage())
+        or "eng"
+end
+
+function BubbleZoom:getOcrPsmMode(api)
+    return G_reader_settings:readSetting("bubblezoom_ocr_psm")
+        or self.ocr_psm
+        or (api and api.getOcrPsmMode and api.getOcrPsmMode())
+        or "auto"
+end
+
+function BubbleZoom:getOcrEngine(api)
+    return G_reader_settings:readSetting("bubblezoom_ocr_engine")
+        or self.ocr_engine
+        or (api and api.getOcrEngine and api.getOcrEngine())
+        or "tesseract"
+end
+
+function BubbleZoom:getPpocrScript(api)
+    return G_reader_settings:readSetting("bubblezoom_ppocr_script")
+        or self.ppocr_script
+        or (api and api.getPpocrScript and api.getPpocrScript())
+        or "cj"
+end
+
+function BubbleZoom:renderBubbleImage(pageno, rect)
+    local scale = 2.0
+    local width = math_max(1, math_floor(rect.w * scale + 0.5))
+    local height = math_max(1, math_floor(rect.h * scale + 0.5))
+    local bb = Blitbuffer.new(width, height, Blitbuffer.TYPE_BBRGB32)
+    bb:fill(Blitbuffer.COLOR_WHITE)
+    local rotation = self.view and self.view.state and self.view.state.rotation or 0
+    local gamma = self.view and self.view.state and self.view.state.gamma or 1.0
+    local rect_scaled = Geom:new(rect)
+    rect_scaled:transformByScale(scale)
+    self.document:drawPage(bb, 0, 0, rect_scaled, pageno, scale, rotation, gamma)
+    return {
+        data = bb.data,
+        w = bb.w,
+        h = bb.h,
+        stride = bb.stride,
+        _bb = bb,
+    }
+end
+
+function BubbleZoom:captureBubbleImageFromScreen(pageno, rect)
+    if not Screen.bb then
+        return nil
+    end
+    local screen_rect = self.view:pageToScreenTransform(pageno, rect)
+    if not screen_rect then
+        return nil
+    end
+    local sx = math_max(0, math_floor(screen_rect.x + 0.5))
+    local sy = math_max(0, math_floor(screen_rect.y + 0.5))
+    local sw = math_min(Screen:getWidth() - sx, math_floor(screen_rect.w + 0.5))
+    local sh = math_min(Screen:getHeight() - sy, math_floor(screen_rect.h + 0.5))
+    if sw <= 0 or sh <= 0 then
+        return nil
+    end
+    local bb = Blitbuffer.new(sw, sh, Blitbuffer.TYPE_BBRGB32)
+    bb:fill(Blitbuffer.COLOR_WHITE)
+    bb:blitFrom(Screen.bb, 0, 0, sx, sy, sw, sh)
+    return {
+        data = bb.data,
+        w = bb.w,
+        h = bb.h,
+        stride = bb.stride,
+        _bb = bb,
+    }
+end
+
+function BubbleZoom:dumpOcrImage(image)
+    if not self.debug_ocr_images or not image or not image._bb or not image._bb.writePNG then
+        return
+    end
+    local debug_dir = DataStorage:getDataDir() .. "/offlinetranslator/debug"
+    lfs.mkdir(DataStorage:getDataDir() .. "/offlinetranslator")
+    lfs.mkdir(debug_dir)
+    local path = debug_dir .. "/bubblezoom-ocr-" .. tostring(os.time()) .. ".png"
+    local ok, err = pcall(function()
+        return image._bb:writePNG(path)
+    end)
+    if ok then
+        logger.warn("BubbleZoom OCR image dumped", path, "size=" .. tostring(image.w) .. "x" .. tostring(image.h), "stride=" .. tostring(image.stride))
+    else
+        logger.warn("BubbleZoom OCR image dump failed", tostring(err))
+    end
+end
+
+function BubbleZoom:showTranslationText(text)
+    if not text or text == "" or not self.overlay_rect or not self.overlay_page then
+        return
+    end
+    local screen_rect = self.view:pageToScreenTransform(self.overlay_page, self.overlay_rect)
+    if not screen_rect then
+        return
+    end
+    local width = math_floor(Screen:getWidth() * 0.9)
+    local content = FrameContainer:new{
+        padding = Size.padding.default,
+        margin = 0,
+        bordersize = Size.border.window,
+        background = Blitbuffer.COLOR_WHITE,
+        TextBoxWidget:new{
+            text = text,
+            width = width - 2 * Size.padding.default,
+            face = Font:getFace("infofont"),
+        },
+    }
+    local size = content:getSize()
+    local x = math_floor((Screen:getWidth() - size.w) / 2)
+    local bottom_y = Screen:getHeight() - size.h - Size.margin.default
+    local top_y = Size.margin.default
+    local overlaps_bottom = screen_rect.y + screen_rect.h > bottom_y
+    if self.translation_widget then
+        UIManager:close(self.translation_widget)
+    end
+    self.translation_widget = BubbleTranslationWidget:new{
+        content = content,
+        dimen = Geom:new{
+            x = x,
+            y = overlaps_bottom and top_y or bottom_y,
+            w = size.w,
+            h = size.h,
+        },
+    }
+    self.translation_x = x
+    self.translation_y = overlaps_bottom and top_y or bottom_y
+    UIManager:show(self.translation_widget)
+end
+
+function BubbleZoom:scheduleBubbleTranslation(pageno, rect, image, delay)
+    self:clearTranslationOverlay()
+    local api = self:offlineTranslator()
+    if not api then
+        logger.warn("BubbleZoom offline translation skipped: Offline Translator API is not available")
+        if image and image._bb then image._bb:free() end
+        return
+    end
+    local from_code, to_code = self:getTranslationDirection(api)
+    if not from_code or not to_code then
+        logger.warn("BubbleZoom offline translation skipped: no installed translation direction selected")
+        if image and image._bb then image._bb:free() end
+        return
+    end
+    if not image then
+        logger.warn("BubbleZoom offline translation skipped: no bubble image captured")
+        return
+    end
+    local tess_lang = self:getTessdataLanguage(api)
+    local ocr_psm = self:getOcrPsmMode(api)
+    local ocr_engine = self:getOcrEngine(api)
+    local ppocr_script = self:getPpocrScript(api)
+    local job_id = self.translation_job_id
+    UIManager:scheduleIn(delay or 0, function()
+        if job_id ~= self.translation_job_id or not self.overlay_rect then
+            image._bb:free()
+            return
+        end
+        self:dumpOcrImage(image)
+        logger.warn("BubbleZoom OCR image", "size=" .. tostring(image.w) .. "x" .. tostring(image.h), "stride=" .. tostring(image.stride), "rect=" .. tostring(rect and rect.x) .. "," .. tostring(rect and rect.y) .. "," .. tostring(rect and rect.w) .. "x" .. tostring(rect and rect.h))
+        local text, ocr_err = api.ocrImageRgba(image, nil, tess_lang, ocr_psm, ocr_engine, ppocr_script)
+        image._bb:free()
+        text = normalizeOcrTextForTranslation(text)
+        if job_id ~= self.translation_job_id or not self.overlay_rect or not text or text == "" then
+            if ocr_err then
+                logger.warn("BubbleZoom offline OCR failed", ocr_err)
+            else
+                logger.warn("BubbleZoom offline OCR returned no text", "engine=" .. tostring(ocr_engine), "lang=" .. tostring(tess_lang), "psm=" .. tostring(ocr_psm), "ppocr=" .. tostring(ppocr_script))
+            end
+            return
+        end
+        logger.warn("BubbleZoom offline OCR text", "engine=" .. tostring(ocr_engine), "lang=" .. tostring(tess_lang), "psm=" .. tostring(ocr_psm), "ppocr=" .. tostring(ppocr_script), "chars=" .. tostring(#text), text)
+        local translated, translate_err = api.translate(text, from_code, to_code)
+        if job_id ~= self.translation_job_id or not self.overlay_rect or not translated or translated == "" then
+            if translate_err then
+                logger.warn("BubbleZoom offline translation failed", translate_err)
+            else
+                logger.warn("BubbleZoom offline translation returned no text", tostring(from_code) .. " -> " .. tostring(to_code))
+            end
+            return
+        end
+        self:showTranslationText(translated)
+    end)
+end
+
+function BubbleZoom:showTranslationDirectionMenu(callback)
+    local api = self:offlineTranslator()
+    if not api or not api.getInstalledPairs then
+        UIManager:show(Notification:new{ text = _("Offline Translator is not available.") })
+        return
+    end
+    local pairs = api.getInstalledPairs()
+    if not pairs or #pairs == 0 then
+        UIManager:show(Notification:new{ text = _("No installed offline translation directions.") })
+        return
+    end
+    local from_code, to_code = self:getTranslationDirection(api)
+    local item_table = {}
+    local menu
+    for __, pair in ipairs(pairs) do
+        table.insert(item_table, {
+            text = pair.from == from_code and pair.to == to_code and ("✔ " .. pair.label) or pair.label,
+            callback = function()
+                G_reader_settings:saveSetting("bubblezoom_translation_from", pair.from)
+                G_reader_settings:saveSetting("bubblezoom_translation_to", pair.to)
+                if api.setDirection then
+                    api.setDirection(pair.from, pair.to)
+                end
+                if callback then
+                    callback(pair.from, pair.to)
+                end
+                UIManager:close(menu)
+            end,
+        })
+    end
+    menu = Menu:new{
+        title = _("Bubble translation direction"),
+        item_table = item_table,
+    }
+    UIManager:show(menu)
+end
+
+function BubbleZoom:showTessdataLanguageMenu(callback)
+    local api = self:offlineTranslator()
+    if not api or not api.getInstalledTessdataLanguages then
+        UIManager:show(Notification:new{ text = _("Offline Translator is not available.") })
+        return
+    end
+    local languages = api.getInstalledTessdataLanguages()
+    if not languages or #languages == 0 then
+        UIManager:show(Notification:new{ text = _("No tessdata languages found.") })
+        return
+    end
+    local current = self:getTessdataLanguage(api)
+    local item_table = {}
+    local menu
+    for __, lang in ipairs(languages) do
+        table.insert(item_table, {
+            text = lang == current and ("✔ " .. lang) or lang,
+            callback = function()
+                G_reader_settings:saveSetting("bubblezoom_tess_lang", lang)
+                if api.setTessdataLanguage then
+                    api.setTessdataLanguage(lang)
+                end
+                if callback then
+                    callback(lang)
+                end
+                UIManager:close(menu)
+            end,
+        })
+    end
+    menu = Menu:new{
+        title = _("Bubble OCR language"),
+        item_table = item_table,
+    }
+    UIManager:show(menu)
+end
+
+function BubbleZoom:showOcrPsmMenu(callback)
+    local api = self:offlineTranslator()
+    if not api or not api.getOcrPsmModes then
+        UIManager:show(Notification:new{ text = _("Offline Translator is not available.") })
+        return
+    end
+    local modes = api.getOcrPsmModes()
+    if not modes or #modes == 0 then
+        UIManager:show(Notification:new{ text = _("No OCR segmentation modes found.") })
+        return
+    end
+    local current = self:getOcrPsmMode(api)
+    local item_table = {}
+    local menu
+    for __, mode in ipairs(modes) do
+        table.insert(item_table, {
+            text_func = function()
+                local selected = self:getOcrPsmMode(api) == mode.id
+                return selected and ("✔ " .. mode.label) or mode.label
+            end,
+            help_text = mode.help,
+            callback = function()
+                self.ocr_psm = mode.id
+                G_reader_settings:saveSetting("bubblezoom_ocr_psm", mode.id)
+                if api.setOcrPsmMode then
+                    api.setOcrPsmMode(mode.id)
+                end
+                if callback then
+                    callback(mode.id)
+                end
+                if menu then
+                    menu:updateItems(nil, true)
+                end
+            end,
+        })
+    end
+    menu = Menu:new{
+        title = _("Bubble OCR segmentation"),
+        item_table = item_table,
+    }
+    function menu:onMenuHold(item)
+        if item.help_text then
+            UIManager:show(InfoMessage:new{ text = item.help_text })
+            return true
+        end
+        return true
+    end
+    UIManager:show(menu)
+end
+
+function BubbleZoom:showOcrEngineMenu(callback)
+    local api = self:offlineTranslator()
+    if not api or not api.getOcrEngines then
+        UIManager:show(Notification:new{ text = _("Offline Translator is not available.") })
+        return
+    end
+    local engines = api.getOcrEngines()
+    local item_table = {}
+    local menu
+    for __, engine in ipairs(engines) do
+        table.insert(item_table, {
+            text_func = function()
+                local selected = self:getOcrEngine(api) == engine.id
+                local suffix = ""
+                if engine.id == "manga_ocr" and api.isMangaOcrInstalled and not api.isMangaOcrInstalled() then
+                    suffix = " (" .. _("missing files") .. ")"
+                end
+                return (selected and "✔ " or "") .. engine.label .. suffix
+            end,
+            help_text = engine.help,
+            callback = function()
+                self.ocr_engine = engine.id
+                G_reader_settings:saveSetting("bubblezoom_ocr_engine", engine.id)
+                if api.setOcrEngine then
+                    api.setOcrEngine(engine.id)
+                end
+                if callback then
+                    callback(engine.id)
+                end
+                if menu then
+                    menu:updateItems(nil, true)
+                end
+            end,
+        })
+    end
+    menu = Menu:new{
+        title = _("Bubble OCR engine"),
+        item_table = item_table,
+    }
+    function menu:onMenuHold(item)
+        if item.help_text then
+            UIManager:show(InfoMessage:new{ text = item.help_text })
+        end
+        return true
+    end
+    UIManager:show(menu)
+end
+
+function BubbleZoom:showPpocrScriptMenu(callback)
+    local api = self:offlineTranslator()
+    if not api or not api.getPpocrScripts then
+        UIManager:show(Notification:new{ text = _("Offline Translator is not available.") })
+        return
+    end
+    local scripts = api.getPpocrScripts()
+    local item_table = {}
+    local menu
+    for __, script in ipairs(scripts) do
+        table.insert(item_table, {
+            text_func = function()
+                local selected = self:getPpocrScript(api) == script.id
+                local installed = not api.isPpocrScriptInstalled or api.isPpocrScriptInstalled(script.id)
+                return (selected and "✔ " or "") .. script.label .. (installed and "" or " (" .. _("missing files") .. ")")
+            end,
+            callback = function()
+                self.ppocr_script = script.id
+                G_reader_settings:saveSetting("bubblezoom_ppocr_script", script.id)
+                if api.setPpocrScript then
+                    api.setPpocrScript(script.id)
+                end
+                if callback then
+                    callback(script.id)
+                end
+                if menu then
+                    menu:updateItems(nil, true)
+                end
+            end,
+        })
+    end
+    menu = Menu:new{
+        title = _("Bubble PPOCR script"),
+        item_table = item_table,
+    }
+    UIManager:show(menu)
+end
+
 ---Populates the main menu entries for Bubble Zoom; used by menu registration.
 ---@param menu_items table Main menu table to append into.
 function BubbleZoom:addToMainMenu(menu_items)
+    local function refreshMenu(menu)
+        if menu and menu.updateItems then
+            menu:updateItems()
+        end
+    end
+
     menu_items.bubblezoom = {
         text = _("Bubble Zoom"),
         sorting_hint = "typeset",
@@ -546,6 +1042,172 @@ function BubbleZoom:addToMainMenu(menu_items)
                     self:setupTouchZones()
                     return true
                 end,
+            },
+            {
+                text = _("Automatically translate bubbles"),
+                checked_func = function() return self.auto_translate end,
+                enabled_func = function() return self:offlineTranslator() ~= nil end,
+                help_text = _("Uses the Offline Translator plugin to read speech bubble text with the selected OCR engine and translate it locally with downloaded Firefox translation models. This works only when Offline Translator is installed, at least one translation direction has been downloaded, and the selected OCR engine has its required data files."),
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    self.auto_translate = not self.auto_translate
+                    if self.auto_translate then
+                        self.translate_on_overlay_hold = false
+                        G_reader_settings:saveSetting("bubblezoom_translate_on_overlay_hold", false)
+                    end
+                    G_reader_settings:saveSetting("bubblezoom_auto_translate", self.auto_translate)
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                end,
+            },
+            {
+                text = _("Translate enlarged bubble on hold"),
+                checked_func = function() return self.translate_on_overlay_hold end,
+                enabled_func = function() return self:offlineTranslator() ~= nil end,
+                help_text = _("When enabled, long-pressing an already enlarged bubble sends that bubble to Offline Translator for local OCR and translation with the selected OCR engine. This mode is mutually exclusive with automatic bubble translation and takes over long-press handling while a bubble is enlarged."),
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    self.translate_on_overlay_hold = not self.translate_on_overlay_hold
+                    if self.translate_on_overlay_hold then
+                        self.auto_translate = false
+                        G_reader_settings:saveSetting("bubblezoom_auto_translate", false)
+                    end
+                    G_reader_settings:saveSetting("bubblezoom_translate_on_overlay_hold", self.translate_on_overlay_hold)
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                end,
+            },
+            {
+                text = _("Translation settings"),
+                enabled_func = function() return self:offlineTranslator() ~= nil end,
+                sub_item_table = {
+                    {
+                        text_func = function()
+                            local api = self:offlineTranslator()
+                            local from_code, to_code = self:getTranslationDirection(api)
+                            if from_code and to_code then
+                                return T(_("Direction: %1 → %2"), from_code, to_code)
+                            end
+                            return _("Direction: not set")
+                        end,
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            self:showTranslationDirectionMenu(function()
+                                refreshMenu(touchmenu_instance)
+                            end)
+                        end,
+                    },
+                    {
+                        text_func = function()
+                            local api = self:offlineTranslator()
+                            local current = self:getOcrEngine(api)
+                            if api and api.getOcrEngines then
+                                for __, engine in ipairs(api.getOcrEngines()) do
+                                    if engine.id == current then
+                                        local suffix = ""
+                                        if engine.id == "manga_ocr" and api.isMangaOcrInstalled and not api.isMangaOcrInstalled() then
+                                            suffix = " (" .. _("missing files") .. ")"
+                                        end
+                                        return T(_("OCR engine: %1"), engine.label .. suffix)
+                                    end
+                                end
+                            end
+                            return T(_("OCR engine: %1"), current)
+                        end,
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            self:showOcrEngineMenu(function()
+                                refreshMenu(touchmenu_instance)
+                            end)
+                        end,
+                    },
+                    {
+                        text_func = function()
+                            return T(_("Tesseract OCR language: %1"), self:getTessdataLanguage(self:offlineTranslator()))
+                        end,
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            self:showTessdataLanguageMenu(function()
+                                refreshMenu(touchmenu_instance)
+                            end)
+                        end,
+                    },
+                    {
+                        text_func = function()
+                            local api = self:offlineTranslator()
+                            local current = self:getOcrPsmMode(api)
+                            if api and api.getOcrPsmModes then
+                                for __, mode in ipairs(api.getOcrPsmModes()) do
+                                    if mode.id == current then
+                                        return T(_("OCR segmentation: %1"), mode.label)
+                                    end
+                                end
+                            end
+                            return T(_("OCR segmentation: %1"), current)
+                        end,
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            self:showOcrPsmMenu(function()
+                                refreshMenu(touchmenu_instance)
+                            end)
+                        end,
+                    },
+                    {
+                        text_func = function()
+                            local api = self:offlineTranslator()
+                            local current = self:getPpocrScript(api)
+                            if api and api.getPpocrScripts then
+                                for __, script in ipairs(api.getPpocrScripts()) do
+                                    if script.id == current then
+                                        return T(_("PPOCR script: %1"), script.label)
+                                    end
+                                end
+                            end
+                            return T(_("PPOCR script: %1"), current)
+                        end,
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            self:showPpocrScriptMenu(function()
+                                refreshMenu(touchmenu_instance)
+                            end)
+                        end,
+                    },
+                    {
+                        text_func = function()
+                            return T(_("Translation delay: %1 s"), string.format("%.2f", self.translation_timeout))
+                        end,
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            local spin = SpinWidget:new{
+                                title_text = _("Translation delay"),
+                                info_text = _("Delay before OCR and translation starts after a bubble is enlarged. Increase this if rapid bubble navigation feels sluggish."),
+                                value = self.translation_timeout,
+                                default_value = 0,
+                                value_min = 0.0,
+                                value_max = 2.0,
+                                value_step = 0.05,
+                                value_hold_step = 0.25,
+                                precision = "%.2f",
+                                callback = function(widget)
+                                    self.translation_timeout = widget.value
+                                    G_reader_settings:saveSetting("bubblezoom_translation_timeout", widget.value)
+                                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                                end,
+                            }
+                            UIManager:show(spin)
+                            if touchmenu_instance then touchmenu_instance:updateItems() end
+                        end,
+                    },
+                    {
+                        text = _("Dump OCR image for debugging"),
+                        checked_func = function() return self.debug_ocr_images end,
+                        help_text = _("When enabled, Bubble Zoom writes each image sent to Offline Translator OCR as a PNG under the Offline Translator debug directory."),
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            self.debug_ocr_images = not self.debug_ocr_images
+                            G_reader_settings:saveSetting("bubblezoom_debug_ocr_images", self.debug_ocr_images)
+                            if touchmenu_instance then touchmenu_instance:updateItems() end
+                        end,
+                    },
+                },
             },
             {
                 text_func = function()
@@ -1132,7 +1794,25 @@ function BubbleZoom:maybeDismissOverlay(ges)
         self.overlay_mask_region_h = nil
         self.overlay_tap_x = nil
         self.overlay_tap_y = nil
+        self:clearTranslationOverlay()
         UIManager:setDirty(self.ui.dialog, "partial")
+        return true
+    end
+    return false
+end
+
+function BubbleZoom:maybeTranslateOverlay(ges)
+    if not self.translate_on_overlay_hold or not self.overlay_rect or not self.overlay_page then
+        return false
+    end
+    local pos = self.view:screenToPageTransform(ges.pos)
+    if not pos or pos.page ~= self.overlay_page then
+        return false
+    end
+    if pos.x >= self.overlay_rect.x and pos.x <= (self.overlay_rect.x + self.overlay_rect.w)
+        and pos.y >= self.overlay_rect.y and pos.y <= (self.overlay_rect.y + self.overlay_rect.h) then
+        local image = self:captureBubbleImageFromScreen(self.overlay_page, self.overlay_src_rect or self.overlay_rect)
+        self:scheduleBubbleTranslation(self.overlay_page, self.overlay_src_rect or self.overlay_rect, image, 0)
         return true
     end
     return false
@@ -1152,6 +1832,10 @@ function BubbleZoom:onBubbleGesture(ges, consume_on_miss)
     local pos = self.view:screenToPageTransform(ges.pos)
     if not pos or not pos.page then
         return false
+    end
+    if consume_on_miss and self:maybeTranslateOverlay(ges) then
+        self.hold_consumed = true
+        return true
     end
     if self:maybeDismissOverlay(ges) then
         return true
@@ -1174,6 +1858,7 @@ function BubbleZoom:onBubbleGesture(ges, consume_on_miss)
             self.overlay_mask_region_h = nil
             self.overlay_tap_x = nil
             self.overlay_tap_y = nil
+            self:clearTranslationOverlay()
             UIManager:setDirty(self.ui.dialog, "partial")
         end
         UIManager:show(Notification:new{
@@ -1705,6 +2390,7 @@ function BubbleZoom:showOverlayRect(pageno, rect, tap_x, tap_y, visited_mask)
     end
 
     local scaled = self:scaleRectAtPoint(padded, tap_x, tap_y, scale, page_size)
+    local translation_image = self:captureBubbleImageFromScreen(pageno, padded)
     self.overlay_src_rect = padded
     self.overlay_rect = scaled
     self.overlay_page = pageno
@@ -1763,6 +2449,11 @@ function BubbleZoom:showOverlayRect(pageno, rect, tap_x, tap_y, visited_mask)
     end
     self.overlay_tap_x = tap_x
     self.overlay_tap_y = tap_y
+    if self.auto_translate then
+        self:scheduleBubbleTranslation(pageno, padded, translation_image, self.translation_timeout)
+    elseif translation_image and translation_image._bb then
+        translation_image._bb:free()
+    end
     UIManager:setDirty(self.ui.dialog, "partial")
     return true
 end
