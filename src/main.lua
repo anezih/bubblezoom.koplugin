@@ -1764,7 +1764,7 @@ function BubbleZoom:isComicDocument()
         return false
     end
     local ext = util.getFileNameSuffix(self.document.file):lower()
-    return ext == "cbz" or ext == "cbr" or ext == "cbt"
+    return ext == "cbz" or ext == "cbr" or ext == "cbt" or ext == "zip" or ext == "rar"
 end
 
 ---Dismisses overlay when a gesture lands inside the overlay rect; used by tap/hold handlers.
