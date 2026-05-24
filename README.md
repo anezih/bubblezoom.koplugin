@@ -6,6 +6,9 @@ This plugin enables users to magnify a speech bubble on a comics/manga page by t
 
 *Plugin preview*
 
+https://github.com/user-attachments/assets/e5a885fc-9271-42f8-bff2-121fc6dd94eb
+
+*Offline translation preview*
 
 # Installation
 
