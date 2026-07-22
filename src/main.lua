@@ -422,17 +422,18 @@ function BubbleZoomOverlay:paintTo(bb, x, y)
     local zoom = view_zoom * overlay_scale
     local rotation = self.view and self.view.state and self.view.state.rotation or 0
     local gamma = self.view and self.view.state and self.view.state.gamma or 1.0
+    local saturation = self.view and self.view.state and self.view.state.saturation or 1.0
     local rect_scaled = Geom:new(owner.overlay_src_rect)
     rect_scaled:transformByScale(zoom)
     if owner.overlay_mask_region and rotation == 0 then
         local tmp_bb = Blitbuffer.new(rw, rh, bb:getType())
-        owner.document:drawPage(tmp_bb, 0, 0, rect_scaled, owner.overlay_page, zoom, rotation, gamma)
+        owner.document:drawPage(tmp_bb, 0, 0, rect_scaled, owner.overlay_page, zoom, rotation, gamma, saturation)
     local outline_width = owner.scanline_outline_width or SCANLINE_OUTLINE_WIDTH_DEFAULT
     local outline = outline_width > 0 and Blitbuffer.COLOR_BLACK or nil
     blitMaskRegionScaled(bb, tmp_bb, rx, ry, owner.overlay_mask_region, owner.overlay_mask_region_w, owner.overlay_mask_region_h, outline, outline_width)
     tmp_bb:free()
     else
-        owner.document:drawPage(bb, rx, ry, rect_scaled, owner.overlay_page, zoom, rotation, gamma)
+        owner.document:drawPage(bb, rx, ry, rect_scaled, owner.overlay_page, zoom, rotation, gamma, saturation)
     end
 end
 
@@ -646,9 +647,10 @@ function BubbleZoom:renderBubbleImage(pageno, rect)
     bb:fill(Blitbuffer.COLOR_WHITE)
     local rotation = self.view and self.view.state and self.view.state.rotation or 0
     local gamma = self.view and self.view.state and self.view.state.gamma or 1.0
+    local saturation = self.view and self.view.state and self.view.state.saturation or 1.0
     local rect_scaled = Geom:new(rect)
     rect_scaled:transformByScale(scale)
-    self.document:drawPage(bb, 0, 0, rect_scaled, pageno, scale, rotation, gamma)
+    self.document:drawPage(bb, 0, 0, rect_scaled, pageno, scale, rotation, gamma, saturation)
     return {
         data = bb.data,
         w = bb.w,
@@ -1896,6 +1898,7 @@ function BubbleZoom:getSauvolaCache(pageno, rotation, gamma)
     local sauvola_k = tonumber_local(self.sauvola_k) or 0.35
     local sauvola_r = tonumber_local(self.sauvola_r) or 128.0
     if sauvola_r <= 0 then sauvola_r = 128.0 end
+    local saturation = self.view and self.view.state and self.view.state.saturation or 1.0
 
     local max_width = tonumber_local(self.sauvola_downsample_max_width) or SAUVOLA_DOWNSAMPLE_MAX_WIDTH_DEFAULT
     if max_width < SAUVOLA_DOWNSAMPLE_MAX_WIDTH_MIN then max_width = SAUVOLA_DOWNSAMPLE_MAX_WIDTH_MIN end
@@ -1923,6 +1926,7 @@ function BubbleZoom:getSauvolaCache(pageno, rotation, gamma)
         and cache.page == pageno
         and cache.rotation == rotation
         and cache.gamma == gamma
+        and cache.saturation == saturation
         and cache.window_size == window_size
         and cache.k == sauvola_k
         and cache.r == sauvola_r
@@ -1930,55 +1934,60 @@ function BubbleZoom:getSauvolaCache(pageno, rotation, gamma)
         return cache
     end
 
-    local tile = self.document:renderPage(pageno, nil, render_scale, rotation, gamma, true)
+    -- Current KOReader nightlies pass saturation before the hinting argument.
+    local tile = self.document:renderPage(pageno, nil, render_scale, rotation, gamma, saturation, true)
     if not tile or not tile.bb then
         return nil
     end
 
     local bb = tile.bb
-    local width = bb:getWidth()
-    local height = bb:getHeight()
-    if width <= 0 or height <= 0 then
-        return nil
-    end
     local prep_start
     if DEBUG_TIMING then
         prep_start = time.now()
     end
+    -- Nightlies return (buffer, bytes_per_pixel), preserving native RGB32.
+    -- v2026.03 returns (temporary_buffer, data, width, stride, height).
+    local data_bb, data_or_bpp, legacy_width, legacy_stride, legacy_height = bb:getBufferData()
+    local owned_bb, src_ptr, src_stride, bytes_per_pixel, width, height, buffer_mode
+    if legacy_stride ~= nil then
+        -- Release API: data is always exposed as RGB24.
+        owned_bb = data_bb
+        src_ptr = data_or_bpp
+        src_stride = tonumber(legacy_stride)
+        bytes_per_pixel = 3
+        width = tonumber(legacy_width)
+        height = tonumber(legacy_height)
+        buffer_mode = "rgb24-release"
+    else
+        -- Nightly API: RGB24 and RGB32 buffers stay native.
+        bytes_per_pixel = tonumber(data_or_bpp)
+        if not data_bb or (bytes_per_pixel ~= 3 and bytes_per_pixel ~= 4) then
+            if data_bb and data_bb ~= bb then data_bb:free() end
+            return nil
+        end
+        if data_bb ~= bb then owned_bb = data_bb end
+        src_ptr = ffi.cast("uint8_t*", data_bb.data)
+        src_stride = tonumber(data_bb.stride)
+        width = tonumber(data_bb.w)
+        height = tonumber(data_bb.h)
+        buffer_mode = bytes_per_pixel == 4 and "rgb32-nightly" or "rgb24-nightly"
+    end
+    if not src_ptr or not src_stride or not width or not height or width <= 0 or height <= 0 then
+        if owned_bb then owned_bb:free() end
+        return nil
+    end
     local pixel_count = width * height
     local luma = ffi.new("uint8_t[?]", pixel_count)
-    local bbdump, src_ptr, src_stride
-    local buffer_mode
-    local bb_type = bb:getType()
-    local bb_rotation = bb:getRotation()
-    local bb_inverse = bb:getInverse()
-    if bb_type == Blitbuffer.TYPE_BBRGB24 and bb_rotation == 0 and bb_inverse == 0 then
-        src_ptr = ffi.cast("uint8_t*", bb.data)
-        src_stride = bb.stride
-        buffer_mode = "direct"
-    elseif bb_type == Blitbuffer.TYPE_BBRGB24 then
-        bbdump = Blitbuffer.new(width, height, Blitbuffer.TYPE_BBRGB24)
-        bbdump:blitFrom(bb)
-        src_ptr = ffi.cast("uint8_t*", bbdump.data)
-        src_stride = bbdump.stride
-        buffer_mode = "blit"
-    else
-        local src_w
-        bbdump, src_ptr, src_w, src_stride = bb:getBufferData()
-        buffer_mode = "convert"
-    end
     local idx = 0
     for y = 0, height - 1 do
         local row = src_ptr + y * src_stride
         for x = 0, width - 1 do
-            local px = row + x * 3
+            local px = row + x * bytes_per_pixel
             luma[idx] = bit_rshift(77 * px[0] + 150 * px[1] + 29 * px[2], 8)
             idx = idx + 1
         end
     end
-    if bbdump then
-        bbdump:free()
-    end
+    if owned_bb then owned_bb:free() end
 
     -- For integral image padding
     local width1 = width + 1
@@ -2049,6 +2058,7 @@ function BubbleZoom:getSauvolaCache(pageno, rotation, gamma)
         page = pageno,
         rotation = rotation,
         gamma = gamma,
+        saturation = saturation,
         window_size = window_size,
         k = sauvola_k,
         r = sauvola_r,
