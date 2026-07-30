@@ -1934,7 +1934,6 @@ function BubbleZoom:getSauvolaCache(pageno, rotation, gamma)
         return cache
     end
 
-    -- Current KOReader nightlies pass saturation before the hinting argument.
     local tile = self.document:renderPage(pageno, nil, render_scale, rotation, gamma, saturation, true)
     if not tile or not tile.bb then
         return nil
@@ -1945,33 +1944,20 @@ function BubbleZoom:getSauvolaCache(pageno, rotation, gamma)
     if DEBUG_TIMING then
         prep_start = time.now()
     end
-    -- Nightlies return (buffer, bytes_per_pixel), preserving native RGB32.
-    -- v2026.03 returns (temporary_buffer, data, width, stride, height).
-    local data_bb, data_or_bpp, legacy_width, legacy_stride, legacy_height = bb:getBufferData()
-    local owned_bb, src_ptr, src_stride, bytes_per_pixel, width, height, buffer_mode
-    if legacy_stride ~= nil then
-        -- Release API: data is always exposed as RGB24.
-        owned_bb = data_bb
-        src_ptr = data_or_bpp
-        src_stride = tonumber(legacy_stride)
-        bytes_per_pixel = 3
-        width = tonumber(legacy_width)
-        height = tonumber(legacy_height)
-        buffer_mode = "rgb24-release"
-    else
-        -- Nightly API: RGB24 and RGB32 buffers stay native.
-        bytes_per_pixel = tonumber(data_or_bpp)
-        if not data_bb or (bytes_per_pixel ~= 3 and bytes_per_pixel ~= 4) then
-            if data_bb and data_bb ~= bb then data_bb:free() end
-            return nil
-        end
-        if data_bb ~= bb then owned_bb = data_bb end
-        src_ptr = ffi.cast("uint8_t*", data_bb.data)
-        src_stride = tonumber(data_bb.stride)
-        width = tonumber(data_bb.w)
-        height = tonumber(data_bb.h)
-        buffer_mode = bytes_per_pixel == 4 and "rgb32-nightly" or "rgb24-nightly"
+    -- KOReader ≥2026.07: getBufferData returns (buffer, bytes_per_pixel), preserving native RGB32.
+    local data_bb, data_or_bpp = bb:getBufferData()
+    local bytes_per_pixel = tonumber(data_or_bpp)
+    if not data_bb or (bytes_per_pixel ~= 3 and bytes_per_pixel ~= 4) then
+        if data_bb and data_bb ~= bb then data_bb:free() end
+        return nil
     end
+    local owned_bb
+    if data_bb ~= bb then owned_bb = data_bb end
+    local src_ptr = ffi.cast("uint8_t*", data_bb.data)
+    local src_stride = tonumber(data_bb.stride)
+    local width = tonumber(data_bb.w)
+    local height = tonumber(data_bb.h)
+    local buffer_mode = bytes_per_pixel == 4 and "rgb32" or "rgb24"
     if not src_ptr or not src_stride or not width or not height or width <= 0 or height <= 0 then
         if owned_bb then owned_bb:free() end
         return nil
